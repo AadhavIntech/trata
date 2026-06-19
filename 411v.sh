@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# =============================================================================
+# TRATA v2 - One Command Full Update + Auto Kiosk Mode (Fixed)
+# Dynamic - Works on any device/username
+# =============================================================================
+set -euo pipefail
+
+APP_DIR="/opt/trata2"
+BINARY_NAME="trata"
+SERVICE_NAME="trata"
+KIOSK_SERVICE="trata-kiosk"
+DOWNLOAD_URL="https://trata.aadhavintech.com/firmware/trata411"   # Update this when new firmware is ready
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+echoerr() { echo -e "${RED}ERROR:${NC} $*" >&2; }
+echook() { echo -e "${GREEN}OK:${NC} $*"; }
+echowarn() { echo -e "${YELLOW}WARN:${NC} $*"; }
+
+echo "=================================================="
+echo "     TRATA v2 - FULL UPDATE + KIOSK MODE"
+echo "=================================================="
+
+if [[ $EUID -ne 0 ]]; then
+    echoerr "This script must be run as root (sudo)"
+    exit 1
+fi
+
+cd "$APP_DIR" || { echoerr "Cannot access $APP_DIR"; exit 1; }
+
+# ===================== DYNAMIC USER DETECTION =====================
+APP_USER="${SUDO_USER:-}"
+
+if [[ -z "$APP_USER" || "$APP_USER" == "root" ]]; then
+    APP_USER=$(stat -c '%U' "$APP_DIR/$BINARY_NAME" 2>/dev/null || echo "")
+fi
+
+if [[ -z "$APP_USER" || "$APP_USER" == "root" ]]; then
+    APP_USER=$(stat -c '%U' "$APP_DIR" 2>/dev/null || echo "pi")
+fi
+
+echo "→ Detected Linux user: $APP_USER"
+# =================================================================
+
+echo "→ Stopping services..."
+systemctl stop "$SERVICE_NAME" "$KIOSK_SERVICE" 2>/dev/null || true
+rm -f data/upload_worker.lock 2>/dev/null || true
+
+# Backup
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="${BINARY_NAME}.old-${TIMESTAMP}"
+if [[ -f "$BINARY_NAME" ]]; then
+    echo "→ Creating backup: $BACKUP_FILE"
+    cp -a "$BINARY_NAME" "$BACKUP_FILE"
+    cp -a "$BINARY_NAME" "${BINARY_NAME}.previous" 2>/dev/null || true
+fi
+
+# Download new binary
+echo "→ Downloading latest binary..."
+wget -q --show-progress -O "${BINARY_NAME}.new" "$DOWNLOAD_URL" || { echoerr "Download failed"; exit 1; }
+chmod 755 "${BINARY_NAME}.new"
+dos2unix "${BINARY_NAME}.new" 2>/dev/null || true
+
+# Smoke test
+echo "→ Performing smoke test..."
+if ! sudo -u "$APP_USER" "./${BINARY_NAME}.new" --version >/dev/null 2>&1; then
+    echoerr "Smoke test failed! New binary is not working."
+    echoerr "Restoring backup..."
+    mv "$BACKUP_FILE" "$BINARY_NAME" 2>/dev/null || true
+    exit 1
+fi
+echook "Smoke test passed"
+
+# Activate new binary
+echo "→ Activating new version..."
+mv "${BINARY_NAME}.new" "$BINARY_NAME"
+APP_GROUP=$(id -gn "$APP_USER")
+chown "$APP_USER:$APP_GROUP" "$BINARY_NAME"
+chmod 755 "$BINARY_NAME"
+
+echo "→ Restarting TRATA service..."
+systemctl daemon-reload
+systemctl start "$SERVICE_NAME"
+
+# ===================== CREATE KIOSK SCRIPT =====================
+echo "→ Setting up Kiosk Mode..."
+
+cat > /usr/local/bin/trata-kiosk.sh <<'EOF'
+#!/bin/bash
+LOGFILE="/tmp/trata-kiosk.log"
+echo "=== TRATA Kiosk Starting at $(date) ===" >> "$LOGFILE"
+
+# Wait for Flask app to be ready
+echo "Waiting for Flask app on http://localhost:5000..." >> "$LOGFILE"
+for i in {1..60}; do
+    if curl -s --max-time 3 http://localhost:5000 > /dev/null; then
+        echo "✅ Flask is ready!" >> "$LOGFILE"
+        break
+    fi
+    sleep 3
+done
+
+export DISPLAY=:0
+xset s off 2>/dev/null || true
+xset -dpms 2>/dev/null || true
+xset s noblank 2>/dev/null || true
+
+unclutter -idle 0.5 -root & >> "$LOGFILE" 2>&1 || true
+
+echo "🚀 Launching Chromium in Kiosk Mode..." >> "$LOGFILE"
+
+exec /usr/bin/chromium-browser \
+  --kiosk \
+  --noerrdialogs \
+  --disable-infobars \
+  --disable-translate \
+  --no-first-run \
+  --fast \
+  --fast-start \
+  --start-maximized \
+  --window-position=0,0 \
+  --ozone-platform=x11 \
+  --disable-features=Translate,OptimizationHints \
+  http://localhost:5000 \
+  --user-data-dir=/home/$USER/.config/chromium-kiosk \
+  --incognito
+EOF
+
+chmod +x /usr/local/bin/trata-kiosk.sh
+chown root:root /usr/local/bin/trata-kiosk.sh
+
+# ===================== CREATE SYSTEMD SERVICE =====================
+echo "→ Creating/Updating systemd kiosk service..."
+
+cat > /etc/systemd/system/trata-kiosk.service <<EOF
+[Unit]
+Description=TRATA Kiosk Mode (Chromium)
+After=graphical.target network.target
+Wants=graphical.target
+
+[Service]
+Type=simple
+User=$APP_USER
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/$APP_USER/.Xauthority
+ExecStart=/usr/local/bin/trata-kiosk.sh
+Restart=on-failure
+RestartSec=8
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=graphical.target
+EOF
+
+chmod 644 /etc/systemd/system/trata-kiosk.service
+
+# ===================== ENABLE & START KIOSK =====================
+echo "→ Restarting Kiosk Mode..."
+systemctl daemon-reload
+systemctl enable "$KIOSK_SERVICE"
+systemctl restart "$KIOSK_SERVICE" || true
+
+echook "UPDATE COMPLETED SUCCESSFULLY"
+echo "=================================================="
+echo " Device User     : $APP_USER"
+echo " Binary Updated  : Yes"
+echo " Kiosk Mode      : Configured & Restarted"
+echo "=================================================="
+
+echo ""
+echo "Recent TRATA logs:"
+journalctl -u "$SERVICE_NAME" -n 30 --no-pager
+
+echo ""
+echo "Kiosk status:"
+systemctl status "$KIOSK_SERVICE" --no-pager -l | head -n 20
+
+echo ""
+echo "Kiosk log:"
+tail -n 30 /tmp/trata-kiosk.log 2>/dev/null || echo "No kiosk log yet"
+
+echo ""
+echo "You can now run updates anytime with:"
+echo "    sudo /opt/trata2/update.sh"
+echo "=================================================="
+
+exit 0
