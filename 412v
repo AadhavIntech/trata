@@ -10,7 +10,8 @@ APP_DIR="/opt/trata2"
 BINARY_NAME="trata"
 SERVICE_NAME="trata"
 KIOSK_SERVICE="trata-kiosk"
-DOWNLOAD_URL="https://trata.aadhavintech.com/firmware/trata411" # Update this when new firmware is ready
+#DOWNLOAD_URL="https://trata.aadhavintech.com/firmware/trata411"
+DOWNLOAD_URL="https://raw.githubusercontent.com/AadhavIntech/trata/main/trata411" # Update this when new firmware is ready
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
